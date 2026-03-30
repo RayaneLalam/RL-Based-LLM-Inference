@@ -1,0 +1,16 @@
+# Virtual environment
+/venv/
+
+# Python cache
+Tree-Based-Speculative-Decoding/__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook
+test.ipynb
+
+# Optional: common extras you may want
+# ----------------------------------
+
+# Environment variables
+.env
