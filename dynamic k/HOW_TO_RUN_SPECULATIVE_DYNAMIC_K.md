@@ -1,10 +1,5 @@
 # How To Run `speculative devoding dynamic k.py`
-
-This file explains how to run the single-file implementation:
-
-- [speculative devoding dynamic k.py](/Users/youcefs/Desktop/school/RL/PROJECT/speculative%20devoding%20dynamic%20k.py)
-
-Because the filename contains spaces, always wrap it in quotes in shell commands.
+ontains spaces, always wrap it in quotes in shell commands.
 
 ## 1. Prerequisites
 
