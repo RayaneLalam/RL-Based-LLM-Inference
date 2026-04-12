@@ -1,0 +1,8 @@
+torch
+transformers
+accelerate
+sentencepiece
+safetensors
+matplotlib
+pandas
+nbformat
