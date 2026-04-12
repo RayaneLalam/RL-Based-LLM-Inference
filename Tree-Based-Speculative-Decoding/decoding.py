@@ -29,8 +29,10 @@ generate
             4. append accepted tokens
 """
 
+import time
+import math
 import torch
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from tree import TreeNode, TokenTree
 from draft import DraftModel
@@ -159,6 +161,15 @@ def stochastic_accept(
         sp = sp / total if total > 1e-12 else target_probs[id(node)]
     else:
         sp = target_probs[id(node)]
+
+    # Numerical safety: clamp, replace any nan/inf, and re-normalise
+    sp = torch.clamp(sp, min=0.0)
+    sp = torch.nan_to_num(sp, nan=0.0, posinf=0.0, neginf=0.0)
+    total = sp.sum()
+    if total < 1e-12:
+        # Fallback to uniform over vocab if distribution collapsed
+        sp = torch.ones_like(sp)
+    sp = sp / sp.sum()
 
     next_token = int(torch.multinomial(sp, num_samples=1))
     accepted.append(next_token)

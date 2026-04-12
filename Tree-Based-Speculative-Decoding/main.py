@@ -64,6 +64,12 @@ def baseline_generate(model, tokenizer, prompt_ids, max_new_tokens, device):
             next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
         else:
             probs = torch.softmax(out.logits[0, -1], dim=-1)
+            probs = torch.clamp(probs, min=0.0)
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            total = probs.sum()
+            if total < 1e-12:
+                probs = torch.ones_like(probs)
+            probs = probs / probs.sum()
             next_tok = torch.multinomial(probs, 1).unsqueeze(0)
         generated = torch.cat([generated, next_tok], dim=1)
         if next_tok.item() == tokenizer.eos_token_id:
