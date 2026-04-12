@@ -177,7 +177,121 @@ def stochastic_accept(
     return accepted
 
 
-# ======================================================================== decoding loop
+# ======================================================================== k → tree mapping
+
+def k_to_tree_params(k: int) -> Tuple[int, int]:
+    """
+    Map a flat draft-token budget *k* to (branching_factor, depth).
+
+    Uses branching_factor=2 and finds the smallest depth D such that
+    the total number of draft nodes (2 + 4 + … + 2^D = 2^(D+1) - 2) >= k.
+
+    Examples:  k=1→(2,1)  k=3→(2,2)  k=5→(2,2)  k=7→(2,3)  k=15→(2,4)
+    """
+    if k <= 0:
+        k = 1
+    b = 2
+    depth = 1
+    while (b ** (depth + 1) - 2) < k:
+        depth += 1
+    return b, depth
+
+
+# ======================================================================== single-step interface
+
+@torch.no_grad()
+def speculative_decode_step(
+    input_ids: torch.Tensor,
+    k: int,
+    draft_model: DraftModel,
+    target_model: TargetModel,
+    state: Optional[dict] = None,
+    use_greedy: bool = False,
+    verify_mode: str = "batched",
+) -> Tuple[torch.Tensor, int, dict]:
+    """
+    Run ONE speculative decoding round.
+
+    This is the interface that the RL controller (Team 2) and the
+    evaluation loop (Team 3) call.
+
+    Parameters
+    ----------
+    input_ids    : (1, seq_len) current prefix tokens.
+    k            : draft-token budget chosen by the RL agent.
+    draft_model  : DraftModel wrapper.
+    target_model : TargetModel wrapper.
+    state        : current system state (batching signals etc.).
+                   Unused in Sprint 1 but kept for Sprint 2.
+    use_greedy   : greedy vs stochastic MSS acceptance.
+    verify_mode  : "batched" or "tree_parallel".
+
+    Returns
+    -------
+    new_sequence    : (1, seq_len + accepted) tensor.
+    accepted_tokens : number of tokens accepted.
+    extra_info      : dict with timing and diagnostic data.
+    """
+    branching_factor, depth = k_to_tree_params(k)
+
+    # ── Step 1: draft ───────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    tree = draft_model.build_tree(
+        prompt_ids=input_ids,
+        branching_factor=branching_factor,
+        depth=depth,
+    )
+    draft_time = time.perf_counter() - t0
+    drafted = tree.size()
+
+    # ── Step 2: verify ──────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    target_probs = target_model.verify_tree(
+        prompt_ids=input_ids,
+        tree=tree,
+        mode=verify_mode,
+    )
+    verify_time = time.perf_counter() - t0
+
+    # ── Step 3: accept / reject ─────────────────────────────────────────
+    t0 = time.perf_counter()
+    if use_greedy:
+        new_tokens = greedy_accept(tree, target_probs)
+    else:
+        new_tokens = stochastic_accept(tree, target_probs)
+    accept_time = time.perf_counter() - t0
+
+    accepted = len(new_tokens)
+    # Last token is always sampled from target (bonus), so draft-accepted = accepted - 1
+    draft_accepted = max(0, accepted - 1)
+    rejection_position = draft_accepted + 1 if draft_accepted < depth else 0
+
+    # ── Step 4: build new sequence ──────────────────────────────────────
+    new_sequence = input_ids.clone()
+    for tok in new_tokens:
+        tok_t = torch.tensor([[tok]], dtype=torch.long, device=input_ids.device)
+        new_sequence = torch.cat([new_sequence, tok_t], dim=1)
+
+    extra_info = {
+        "draft_time": draft_time,
+        "verify_time": verify_time,
+        "accept_time": accept_time,
+        "total_time": draft_time + verify_time + accept_time,
+        "drafted": drafted,
+        "accepted": accepted,
+        "draft_accepted": draft_accepted,
+        "acceptance_rate": draft_accepted / max(drafted, 1),
+        "rejection_position": rejection_position,
+        "new_token_ids": new_tokens,
+        "branching_factor": branching_factor,
+        "depth": depth,
+        "k_requested": k,
+    }
+
+    return new_sequence, accepted, extra_info
+
+
+# ======================================================================== full decoding loop
 
 @torch.no_grad()
 def generate(
