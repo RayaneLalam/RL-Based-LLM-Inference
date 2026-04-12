@@ -272,11 +272,14 @@ def speculative_decode_step(
         tok_t = torch.tensor([[tok]], dtype=torch.long, device=input_ids.device)
         new_sequence = torch.cat([new_sequence, tok_t], dim=1)
 
+    normalized_tree_cost = math.log2(drafted + 1.0)
+
     extra_info = {
         "draft_time": draft_time,
         "verify_time": verify_time,
         "accept_time": accept_time,
         "total_time": draft_time + verify_time + accept_time,
+        "step_time_s": draft_time + verify_time + accept_time,
         "drafted": drafted,
         "accepted": accepted,
         "draft_accepted": draft_accepted,
@@ -284,8 +287,13 @@ def speculative_decode_step(
         "rejection_position": rejection_position,
         "new_token_ids": new_tokens,
         "branching_factor": branching_factor,
+        "tree_branching_factor": branching_factor,
+        "tree_nodes": drafted,
+        "normalized_tree_cost": normalized_tree_cost,
         "depth": depth,
         "k_requested": k,
+        "used_target_fallback": draft_accepted < depth,
+        "fallback_token_id": new_tokens[-1] if draft_accepted < depth else None,
     }
 
     return new_sequence, accepted, extra_info
