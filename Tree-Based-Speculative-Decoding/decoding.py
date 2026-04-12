@@ -260,27 +260,37 @@ def generate(
             total_generated += 1
 
             if eos_token_id is not None and tok == eos_token_id:
+                stats = _build_stats(total_accepted, total_drafted, iterations)
                 if verbose:
-                    _print_stats(total_accepted, total_drafted, iterations)
-                return generated
+                    _print_stats(stats)
+                return generated, stats
 
             if total_generated >= max_new_tokens:
                 break
 
+    stats = _build_stats(total_accepted, total_drafted, iterations)
     if verbose:
-        _print_stats(total_accepted, total_drafted, iterations)
-    return generated
+        _print_stats(stats)
+    return generated, stats
 
 
-def _print_stats(accepted: int, drafted: int, iters: int) -> None:
-    rate = accepted / max(drafted, 1)
-    avg  = accepted / max(iters, 1)
+def _build_stats(accepted: int, drafted: int, iters: int) -> dict:
+    return {
+        "iterations": iters,
+        "tokens_accepted": accepted,
+        "tokens_drafted": drafted,
+        "acceptance_rate": accepted / max(drafted, 1),
+        "avg_tokens_per_iter": accepted / max(iters, 1),
+    }
+
+
+def _print_stats(stats: dict) -> None:
     print(
         f"\n[SpecInfer stats]\n"
-        f"  iterations      : {iters}\n"
-        f"  tokens accepted : {accepted}\n"
-        f"  tokens drafted  : {drafted}\n"
-        f"  acceptance rate : {rate:.1%}\n"
-        f"  avg tokens/iter : {avg:.2f}  "
+        f"  iterations      : {stats['iterations']}\n"
+        f"  tokens accepted : {stats['tokens_accepted']}\n"
+        f"  tokens drafted  : {stats['tokens_drafted']}\n"
+        f"  acceptance rate : {stats['acceptance_rate']:.1%}\n"
+        f"  avg tokens/iter : {stats['avg_tokens_per_iter']:.2f}  "
         f"(baseline = 1.00 for standard decoding)\n"
     )

@@ -27,7 +27,11 @@ Requirements:
     pip install torch transformers accelerate
 """
 
+import json
+import os
 import time
+from datetime import datetime
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -111,7 +115,7 @@ def main():
     print("─" * 60)
 
     t0 = time.perf_counter()
-    spec_ids = generate(
+    spec_ids, spec_stats = generate(
         prompt_ids      = prompt_ids,
         draft_model     = draft_model,
         target_model    = target_model,
@@ -147,11 +151,46 @@ def main():
     print(f"Generated ({base_time:.2f}s):\n  {base_text!r}\n")
 
     # ── summary ───────────────────────────────────────────────────────────────
+    speedup = base_time / spec_time if spec_time > 0 else 0.0
     if base_time > 0:
-        speedup = base_time / spec_time
         print(f"Wall-clock speedup: {speedup:.2f}×")
         print("(Note: on CPU the draft-model overhead dominates; "
               "speedup is most visible on GPU with model offloading.)")
+
+    # ── save run ─────────────────────────────────────────────────────────────
+    now = datetime.now()
+    run_data = {
+        "timestamp": now.isoformat(timespec="seconds"),
+        "device": device,
+        "config": {
+            "draft_model": DRAFT_NAME,
+            "target_model": TARGET_NAME,
+            "branching_factor": BRANCHING,
+            "depth": DEPTH,
+            "max_tokens": MAX_TOKENS,
+            "use_greedy": USE_GREEDY,
+            "verify_mode": VERIFY_MODE,
+            "prompt": PROMPT,
+        },
+        "speculative": {
+            "generated_text": spec_text,
+            "time_seconds": round(spec_time, 2),
+            **spec_stats,
+        },
+        "baseline": {
+            "generated_text": base_text,
+            "time_seconds": round(base_time, 2),
+        },
+        "speedup": round(speedup, 4),
+    }
+
+    runs_dir = os.path.join(os.path.dirname(__file__), "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+    filename = f"run_{now.strftime('%Y-%m-%d_%H%M%S')}.json"
+    filepath = os.path.join(runs_dir, filename)
+    with open(filepath, "w") as f:
+        json.dump(run_data, f, indent=2)
+    print(f"\nRun saved to: {filepath}")
 
 
 if __name__ == "__main__":
