@@ -3,11 +3,7 @@
 This repository contains the Sprint 1 research material and the runnable
 `dynamic k` prototype for RL-controlled speculative decoding.
 
-## Top Level
 
-- `SpecInfer.pdf`: reference paper used for the greedy tree verification path.
-- `RL-Tasks-Sprint-1.pdf`: sprint task definition.
-- `dynamic k/`: the actual Python project.
 
 ## What The Code Does
 
