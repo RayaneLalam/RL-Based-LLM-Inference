@@ -8,8 +8,9 @@ MODEL_PROFILES: dict[str, tuple[str, str]] = {
     "m1_tiny_same": ("sshleifer/tiny-gpt2", "sshleifer/tiny-gpt2"),
     "m1_tiny_two_models": ("sshleifer/tiny-gpt2", "distilgpt2"),
     "balanced_gpt2": ("distilgpt2", "gpt2"),
+    "medium_models": ("gpt2", "meta-llama/Llama-3.1-8B"),
 }
-DEFAULT_MODEL_PROFILE = "m1_tiny_two_models"
+DEFAULT_MODEL_PROFILE = "balanced_gpt2"
 
 
 def _read_env(name: str) -> str | None:
