@@ -30,6 +30,7 @@ class TreeNode:
     path_token_ids: tuple[int, ...] = ()
     path_node_ids: tuple[int, ...] = ()
     draft_logprob: float = 0.0
+    draft_prob: float = 1.0
     children: list["TreeNode"] = field(default_factory=list)
 
 
@@ -130,22 +131,34 @@ class HuggingFaceTreeSpeculativeDecoder:
             branch = int(state.get("tree_branching_factor", 2))
         branch = max(1, int(branch or 2))
 
+        acceptance_mode = self._resolve_acceptance_mode(state)
+        draft_sampling = self._resolve_draft_sampling(state)
+        target_sampling = self._resolve_target_sampling(state)
+
         draft_start = time.perf_counter()
         root, tree_node_count, draft_forward_passes, plan = self._build_tree(
             input_ids,
             k=k,
             branching_factor=branch,
             state=state,
+            draft_sampling=draft_sampling,
         )
         draft_time_s = time.perf_counter() - draft_start
 
         verify_start = time.perf_counter()
-        verified = self._verify_tree(input_ids, root)
+        verified = self._verify_tree(
+            input_ids,
+            root,
+            acceptance_mode=acceptance_mode,
+            target_sampling=target_sampling,
+        )
         verify_time_s = time.perf_counter() - verify_start
 
         step_time_s = draft_time_s + verify_time_s
         normalized_tree_cost = math.log2(tree_node_count + 1.0)
         acceptance_rate = verified["accepted_tokens"] / float(k)
+
+        verification_mode = "specinfer_greedy" if acceptance_mode == "greedy" else "specinfer_mss"
 
         extra_info = {
             "draft_model_name": self.draft_model_name,
@@ -166,13 +179,21 @@ class HuggingFaceTreeSpeculativeDecoder:
             "verify_time_s": verify_time_s,
             "step_time_s": step_time_s,
             "target_logprob_mean": verified["target_logprob_mean"],
-            "verification_mode": "specinfer_greedy",
+            "verification_mode": verification_mode,
             "draft_forward_passes": draft_forward_passes,
             "target_forward_passes": 1,
             "dfs_tree_nodes": verified["dfs_tree_nodes"],
             "verified_nodes": verified["verified_nodes"],
             "planned_node_budget": plan.node_budget,
             "depth_widths": list(plan.depth_widths),
+            "acceptance_mode": acceptance_mode,
+            "draft_sampling": draft_sampling["mode"],
+            "draft_top_k": draft_sampling["top_k"],
+            "draft_top_p": draft_sampling["top_p"],
+            "draft_temperature": draft_sampling["temperature"],
+            "target_top_k": target_sampling["top_k"],
+            "target_top_p": target_sampling["top_p"],
+            "target_temperature": target_sampling["temperature"],
         }
         return verified["new_sequence"], verified["accepted_tokens"], extra_info
 
@@ -182,6 +203,7 @@ class HuggingFaceTreeSpeculativeDecoder:
         k: int,
         branching_factor: int,
         state: dict[str, Any] | None = None,
+        draft_sampling: dict[str, Any] | None = None,
     ) -> tuple[TreeNode, int, int, TreeExpansionPlan]:
         """Expand a draft tree using batched anisotropic expansion."""
         root = TreeNode(
@@ -217,14 +239,22 @@ class HuggingFaceTreeSpeculativeDecoder:
                     break
 
                 local_width = min(width, remaining_budget, int(entry.next_log_probs.shape[-1]))
-                top_log_probs, top_token_ids = torch.topk(
-                    entry.next_log_probs,
-                    k=local_width,
-                    dim=-1,
-                )
+                if draft_sampling and draft_sampling["mode"] == "sample":
+                    token_ids, token_log_probs, token_probs = self._sample_draft_children(
+                        entry.next_log_probs,
+                        local_width,
+                        draft_sampling,
+                    )
+                else:
+                    token_log_probs, token_ids = torch.topk(
+                        entry.next_log_probs,
+                        k=local_width,
+                        dim=-1,
+                    )
+                    token_probs = torch.exp(token_log_probs)
 
                 for branch_idx in range(local_width):
-                    token_id = int(top_token_ids[branch_idx].item())
+                    token_id = int(token_ids[branch_idx].item())
                     child = TreeNode(
                         node_id=next_node_id,
                         token_id=token_id,
@@ -232,7 +262,8 @@ class HuggingFaceTreeSpeculativeDecoder:
                         parent_id=entry.node.node_id,
                         path_token_ids=entry.node.path_token_ids + (token_id,),
                         path_node_ids=entry.node.path_node_ids + (next_node_id,),
-                        draft_logprob=entry.node.draft_logprob + float(top_log_probs[branch_idx].item()),
+                        draft_logprob=entry.node.draft_logprob + float(token_log_probs[branch_idx].item()),
+                        draft_prob=float(token_probs[branch_idx].item()),
                     )
                     entry.node.children.append(child)
                     next_frontier_nodes.append(child)
@@ -271,6 +302,8 @@ class HuggingFaceTreeSpeculativeDecoder:
         self,
         input_ids: torch.Tensor,
         root: TreeNode,
+        acceptance_mode: str = "stochastic",
+        target_sampling: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Verify the tree using a single packed target-model pass."""
         packed = self._flatten_tree_for_verification(input_ids, root)
@@ -279,6 +312,14 @@ class HuggingFaceTreeSpeculativeDecoder:
             position_ids=packed.position_ids,
             attention_mask=packed.attention_mask,
         )
+        if acceptance_mode == "stochastic":
+            return self._verify_stochastic_outputs(
+                input_ids=input_ids,
+                root=root,
+                packed=packed,
+                log_probs=log_probs,
+                target_sampling=target_sampling or {},
+            )
         return self._verify_greedy_outputs(
             input_ids=input_ids,
             root=root,
@@ -424,6 +465,182 @@ class HuggingFaceTreeSpeculativeDecoder:
             "dfs_tree_nodes": len(packed.flat_nodes),
             "verified_nodes": verified_nodes,
         }
+
+    def _verify_stochastic_outputs(
+        self,
+        input_ids: torch.Tensor,
+        root: TreeNode,
+        packed: PackedTreeInputs,
+        log_probs: torch.Tensor,
+        target_sampling: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply MSS-style stochastic verification (SpecInfer Algorithm 2)."""
+        current_node = root
+        accepted_token_ids: list[int] = []
+        output_logprobs: list[float] = []
+        rejection_position = -1
+        fallback_token_id: int | None = None
+        used_target_fallback = False
+        verified_nodes = 0
+        final_residual: torch.Tensor | None = None
+
+        while current_node.children:
+            if current_node.node_id == root.node_id:
+                output_position = packed.prompt_length - 1
+            else:
+                output_position = packed.output_positions[current_node.node_id]
+
+            node_log_probs = log_probs[output_position]
+            probs = torch.exp(node_log_probs)
+
+            children = current_node.children[:]
+            perm = torch.randperm(len(children), device=probs.device).tolist()
+            children = [children[i] for i in perm]
+
+            residual = probs.clone()
+            accepted_child: TreeNode | None = None
+
+            for child in children:
+                token_id = int(child.token_id)
+                p_t = float(probs[token_id].item())
+                p_d = float(child.draft_prob)
+                alpha = min(1.0, p_t / (p_d + 1e-12))
+
+                if torch.rand(1, device=probs.device).item() <= alpha:
+                    accepted_token_ids.append(token_id)
+                    accepted_child = child
+                    output_logprobs.append(float(node_log_probs[token_id].item()))
+                    verified_nodes += 1
+                    break
+
+                residual[token_id] = max(0.0, residual[token_id].item() - p_d)
+
+            if accepted_child is not None:
+                current_node = accepted_child
+                continue
+
+            final_residual = residual
+            rejection_position = current_node.depth + 1
+            used_target_fallback = True
+            break
+
+        if current_node.node_id == root.node_id:
+            output_position = packed.prompt_length - 1
+        else:
+            output_position = packed.output_positions[current_node.node_id]
+
+        if final_residual is not None:
+            terminal_token_id, terminal_logprob = self._sample_from_logits(
+                torch.log(torch.clamp(final_residual, min=1e-12)),
+                target_sampling,
+            )
+            fallback_token_id = terminal_token_id
+        else:
+            terminal_token_id, terminal_logprob = self._sample_from_logits(
+                log_probs[output_position],
+                target_sampling,
+            )
+
+        output_logprobs.append(float(terminal_logprob))
+        emitted_token_ids = accepted_token_ids + [terminal_token_id]
+        new_sequence = self._append_tokens(input_ids, tuple(emitted_token_ids))
+
+        return {
+            "new_sequence": new_sequence,
+            "accepted_tokens": len(accepted_token_ids),
+            "accepted_token_ids": accepted_token_ids,
+            "rejection_position": rejection_position,
+            "fallback_token_id": fallback_token_id,
+            "used_target_fallback": used_target_fallback,
+            "terminal_token_id": terminal_token_id,
+            "emitted_token_ids": emitted_token_ids,
+            "emitted_tokens": len(emitted_token_ids),
+            "target_logprob_mean": sum(output_logprobs) / len(output_logprobs),
+            "dfs_tree_nodes": len(packed.flat_nodes),
+            "verified_nodes": verified_nodes,
+        }
+
+    def _resolve_acceptance_mode(self, state: dict[str, Any] | None) -> str:
+        if state is None:
+            return "stochastic"
+        mode = str(state.get("acceptance_mode", "stochastic")).lower()
+        if mode in {"greedy"}:
+            return "greedy"
+        return "stochastic"
+
+    def _resolve_draft_sampling(self, state: dict[str, Any] | None) -> dict[str, Any]:
+        mode = "topk"
+        if state is not None:
+            raw_mode = str(state.get("draft_sampling", "topk")).lower()
+            if raw_mode in {"sample", "stochastic"}:
+                mode = "sample"
+        return {
+            "mode": mode,
+            "top_k": int(state.get("draft_top_k", 0)) if state else 0,
+            "top_p": float(state.get("draft_top_p", 1.0)) if state else 1.0,
+            "temperature": float(state.get("draft_temperature", 1.0)) if state else 1.0,
+        }
+
+    def _resolve_target_sampling(self, state: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "top_k": int(state.get("target_top_k", 0)) if state else 0,
+            "top_p": float(state.get("target_top_p", 1.0)) if state else 1.0,
+            "temperature": float(state.get("target_temperature", 1.0)) if state else 1.0,
+        }
+
+    def _sample_draft_children(
+        self,
+        log_probs: torch.Tensor,
+        count: int,
+        sampling: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        filtered = self._apply_top_k_top_p(log_probs, sampling["top_k"], sampling["top_p"])
+        temperature = max(float(sampling["temperature"]), 1e-5)
+        probs = torch.softmax(filtered / temperature, dim=-1)
+        if count >= probs.shape[-1]:
+            token_ids = torch.arange(probs.shape[-1], device=probs.device)
+        else:
+            token_ids = torch.multinomial(probs, num_samples=count, replacement=False)
+        token_probs = probs[token_ids]
+        token_log_probs = torch.log(torch.clamp(token_probs, min=1e-12))
+        return token_ids, token_log_probs, token_probs
+
+    def _sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        sampling: dict[str, Any],
+    ) -> tuple[int, float]:
+        filtered = self._apply_top_k_top_p(logits, sampling.get("top_k", 0), sampling.get("top_p", 1.0))
+        temperature = max(float(sampling.get("temperature", 1.0)), 1e-5)
+        probs = torch.softmax(filtered / temperature, dim=-1)
+        token_id = int(torch.multinomial(probs, num_samples=1).item())
+        log_prob = float(torch.log(torch.clamp(probs[token_id], min=1e-12)).item())
+        return token_id, log_prob
+
+    def _apply_top_k_top_p(
+        self,
+        logits: torch.Tensor,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        filtered = logits.clone()
+        vocab_size = filtered.shape[-1]
+        if top_k and top_k > 0 and top_k < vocab_size:
+            topk_vals, _ = torch.topk(filtered, top_k)
+            cutoff = topk_vals[-1]
+            filtered = torch.where(filtered < cutoff, torch.tensor(float("-inf"), device=filtered.device), filtered)
+
+        if top_p is not None and top_p < 1.0:
+            probs = torch.softmax(filtered, dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            mask = cumulative > max(top_p, 1e-6)
+            if mask[0].item():
+                mask[0] = False
+            remove_indices = sorted_indices[mask]
+            filtered[remove_indices] = float("-inf")
+
+        return filtered
 
     def _plan_tree_shape(
         self,
