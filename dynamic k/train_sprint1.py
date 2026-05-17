@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import os
 
-from rl.controller import QLearningController
-from simulation.env import TreeSpeculativeDecodingEnv
+from simulated_qlearning.controller import QLearningController
+from simulated_qlearning.env import TreeSpeculativeDecodingEnv
 
 
 def build_parser() -> argparse.ArgumentParser:

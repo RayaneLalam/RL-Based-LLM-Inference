@@ -25,8 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from decoding.speculative import HuggingFaceTreeSpeculativeDecoder
-from rl.controller import QLearningController
-from simulation.env import TreeSpeculativeDecodingEnv
+from simulated_qlearning.controller import QLearningController
+from simulated_qlearning.env import TreeSpeculativeDecodingEnv
 from state.features import initialize_state
 from utils.model_config import resolve_model_pair
 from utils.metrics import compute_real_latency_reward, compute_reward, rollout_summary, update_state_from_feedback

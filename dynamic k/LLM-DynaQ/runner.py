@@ -11,7 +11,7 @@ sys.path.append(str(PROJECT_ROOT))
 sys.path.append(str(LLM_DYNAQ_ROOT))
 
 from decoding.speculative import HuggingFaceTreeSpeculativeDecoder
-from rl.controller import DynaQController
+from controller import DynaQController
 
 from llm_env import LLMTreeSpeculativeDecodingEnv
 from prompt_dataset import PromptDataset
